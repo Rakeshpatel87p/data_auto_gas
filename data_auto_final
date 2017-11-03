@@ -1,0 +1,558 @@
+
+                                              /*
+                                              
+                     Data Automation Tool - Getting Metrics in Real Time
+                                              
+               Now processing Yieldbot, Rubicon, Centro data to revenueUpdated table
+               
+     Finalized: https://datastudio.google.com/reporting/0B_R0tVVrYSGqb1psRnI0NFQwNnM/page/4HrE
+       
+      Testing: https://datastudio.google.com/reporting/0B7qtleBfw8JIa1A0Y2Q2c3dEa3M/page/k8pG
+                                              
+                                              */
+
+
+/*
+
+Time reports come in:
+
+Yieldbot - 6-6:30AM, Verified: 9/28 
+Rubicon - 1PM, Verified: 9/28 
+Centro - 6AM, Verified: 9/28 
+Facebook - API Calls every 6 hrs
+
+-----------
+
+AdX - #'s still need to be verified
+
+*/
+
+
+//Main function that retrieves relevant email from gmail account and processes data
+function processEmailsInChronoOrder() {
+    var tableToUse = 'revenueUpdated';
+    var lengthOfThreadToProcess;
+    var adSource;
+    var rowsOfDataProcessed;
+    var messagesOrganizedByDate = [];    
+    var label = GmailApp.getUserLabelByName("finalized");
+    var processedLabel = GmailApp.getUserLabelByName('successfullyProcessed')
+    var threads = label.getThreads();
+    for (var i = 0; i < threads.length; i++) {
+        var messages = threads[i].getMessages();
+        for (var j = 0; j < messages.length; j++) {
+            message = messages[j];
+            if (message.isUnread()) {  
+              var emailSubject = message.getSubject();
+                adSource = getAdSourceName(emailSubject);
+                var emailDate = message.getDate();
+                var siteDetails = {
+                    emailDate: emailDate,
+                    adSource: adSource,
+                    subject: emailSubject
+                };
+                var dataForUpload = getDataForUpload(message, siteDetails);
+                messagesOrganizedByDate.push({
+                    emailDate: emailDate,
+                    site: adSource,
+                    dataForUpload: dataForUpload
+                });
+              message.markRead();
+              threads[i].addLabel(processedLabel);
+              threads[i].removeLabel(label)
+            }
+        }
+
+    }
+
+    //Organize Messages By Date
+    messagesOrganizedByDate.sort(function(a, b) {
+        return new Date(a.emailDate).getTime() - new Date(b.emailDate).getTime()
+    });
+    for (var k = 0; k < messagesOrganizedByDate.length; k++) {
+        rowsOfDataProcessed = messagesOrganizedByDate[k].dataForUpload.length;
+        mySqlRun(tableToUse, messagesOrganizedByDate[k].dataForUpload);
+    }
+    sendEmailUpdate(adSource, rowsOfDataProcessed, tableToUse, messagesOrganizedByDate.emailDate, lengthOfThreadToProcess)
+    Logger.log('Done uploading!')
+};
+
+function getAdSourceName(emailSubject){
+  if (emailSubject.indexOf('Verticals Programmatic Automation Report') > -1){
+    return 'AdExchange';
+  }
+  else if (emailSubject.indexOf('Centro Brand Exchange') > -1){
+    return 'Centro'
+  }
+  else if (emailSubject.indexOf('[Rubicon Report]') > -1){
+    return 'Rubicon'
+  }
+  else if (emailSubject.indexOf('Yieldbot Month-To-Date Report') > -1){
+    return 'Yieldbot'
+  }
+  else if (emailSubject.indexOf('Gamut') > -1){
+    return 'Gamut'
+  }
+  else if (emailSubject.indexOf('CSV Email Delivery') > -1){
+    return 'Sovrn'
+  }
+}
+
+function getDataForUpload(message, siteDetails) { 
+    var attachments = message.getAttachments();
+    var allDatesArray = [];
+    var progSpreadsheet;
+    if (siteDetails.adSource == 'Gamut') {
+        for (var j = 0; j < attachments.length; j++) {
+            var files = Utilities.unzip(attachments[j]);
+            for (var k = 0; k < files.length; k++) {
+                // 3) Converts File to Google Sheets
+                progSpreadsheet = convertExcel2Sheets(files[k], siteDetails);
+            }
+        }
+    } else {
+        var files = attachments[0];
+        // 3) Converts File to Google Sheets
+        progSpreadsheet = convertExcel2Sheets(files, siteDetails);
+    }
+    // 4) Extracts Data for upload to DB - choose correct readDoc 
+    //Break up function here? Send excel file into folder --> check folder for processing to Db. 
+    var adSourceToUse = 'read' + siteDetails.adSource + 'SheetData(progSpreadsheet, siteDetails)';
+    //***Research drawbacks of using eval()*****
+    Logger.log(adSourceToUse)  
+  var allDatesArray = eval(adSourceToUse);
+    return allDatesArray;
+};
+
+function convertExcel2Sheets(excelFile, siteDetails) { 
+  // Parameters for Drive API Simple Upload request (see https://developers.google.com/drive/web/manage-uploads#simple)
+    var uploadParams = {
+        method: "post",
+        muteHttpExceptions: true,
+        contentType: "application/vnd.ms-excel", // works for both .xls and .xlsx files
+        contentLength: excelFile.getBytes().length,
+        headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
+        payload: excelFile.getBytes()
+    };
+    myFolderId = getFolderId(siteDetails.adSource);
+    //Logger.log("My new folder id is " + myFolderId);
+    myFolder = DriveApp.getFolderById(myFolderId);
+    myFileId = getFileId(myFolder, siteDetails.adSource + '_' + siteDetails.emailDate);
+
+    var uploadResponse;
+
+    // Create payload (body) data for updating converted file"s name and parent folder(s)
+    var payloadData = {
+        title: siteDetails.adSource + '_' + siteDetails.emailDate, 
+        parents: []
+    };
+
+    if (myFileId == "") {
+        // Upload file to Drive root folder and convert to Sheets
+        //processGamutEmailsInChrono not liking this line:
+        var uploadResponse = UrlFetchApp.fetch("https://www.googleapis.com/upload/drive/v2/files/?uploadType=media&convert=true", uploadParams);
+        var folder = DriveApp.getFolderById(myFolderId); // check that this folder id exists in drive and user can write to it
+        payloadData.parents.push({ id: myFolderId });
+    } else {
+        uploadParams.method = "put";
+        var uploadResponse = UrlFetchApp.fetch("https://www.googleapis.com/upload/drive/v2/files/" + myFileId + "?uploadType=media&convert=true", uploadParams);
+    }
+
+
+    // Parse upload&convert response data (need this to be able to get id of converted sheet)
+    var fileDataResponse = JSON.parse(uploadResponse.getContentText());
+
+    // Parameters for Drive API File Update request (see https://developers.google.com/drive/v2/reference/files/update)
+    var updateParams = {
+        method: "put",
+        muteHttpExceptions: true,
+        headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
+        contentType: "application/json",
+        payload: JSON.stringify(payloadData)
+    };
+
+    // Update metadata (filename and parent folder(s)) of converted sheet
+    UrlFetchApp.fetch("https://www.googleapis.com/drive/v2/files/" + fileDataResponse.id, updateParams);
+    return SpreadsheetApp.openById(fileDataResponse.id);
+}
+
+//Returns ID for folder if it exists in root folder. Creates folder if it doesn"t exist.
+function getFolderId(folderName) {
+  var found = false;
+  folderId = "";
+  var folders = DriveApp.getFolders();
+  while (folders.hasNext()) {
+      var folder = folders.next();
+      if (folder.getName() == folderName) {
+          found = true;
+          folderId = folder.getId();
+          break;
+      } else {
+          // Logger.log("Folder " + folderName + " does not exist.");
+      }
+  }
+  if (!found) {
+      folder = DriveApp.createFolder(folderName)
+      found = true;
+      folderId = folder.getId();
+  }
+  return folderId;
+}
+
+//Returns ID for file if it exists in folder. Returns blank string if not.
+//Called on L98
+function getFileId(folder, siteDetails) {
+  var found = false;
+  fileId = "";
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+      var file = files.next();
+      if (file.getName() == siteDetails.adSource + '_' + siteDetails.emailDate)/*(file.getName() == siteDetails.website + siteDetails.screenSize_device)*/ {
+          //Logger.log("File " + siteDetails.website + siteDetails.screenSize_device + " exists and has ID " + file.getId());
+          found = true;
+          fileId = file.getId();
+          break;
+      } else {
+          //Logger.log("File " + siteDetails.website + siteDetails.screenSize_device + " does not exist.");
+      }
+  }
+  return fileId;
+}
+
+//Reads data from Yieldbot Sheet
+function readYieldbotSheetData(mySpreadsheet) {
+  var  allDatesArray = [];
+  var mySheet = mySpreadsheet.getSheetByName("Ad Slot Daily Breakdown");
+  var rowsToProcess = yieldbotFindCell(mySheet, "Filler");
+    //Get the row# .getRow() for full data info
+
+  for (var i = 0; i < rowsToProcess.length; i++) {
+    //getRange(row, colum, #row, #col);
+    var rowOfData = mySheet.getRange(rowsToProcess[i], 1, 1, 11).getValues();
+    var myObject = {
+      date: standardizeDate(rowOfData[0][0]),
+      adSource: "Yieldbot",
+      brand: getSiteName(rowOfData[0][1]),
+      platform: normalizePlatform(rowOfData[0][2]),
+      placement: rowOfData[0][2],
+      size: rowOfData[0][3],
+      impressions: rowOfData[0][7],
+      opportunities: rowOfData[0][6],
+      unfilled: 0,
+      revenue: rowOfData[0][10],
+      source: 'Programmatic'
+            
+    };
+    allDatesArray.push(myObject);
+  }
+  return allDatesArray;
+}
+
+function yieldbotFindCell(mySpreadsheet, searchTerm) {
+  var dataRange = mySpreadsheet.getDataRange();
+  var values = dataRange.getValues();
+  var rowsToProcess = [];
+  for (var i = 0; i < values.length; i++) {
+      //var row = "";
+      for (var j = 0; j < values[i].length; j++) {
+          if (values[i][j] == "SEC Country Mobile" || 
+              values[i][j] == "Dawg Nation Mobile" || 
+              values[i][j] == "Mundo Hispanico Mobile" || 
+              values[i][j] == "All 22 Mobile" || 
+              values[i][j] == "Land of 10 Mobile"
+             ) {
+              //row = values[i][j+1];
+              rowsToProcess.push(i + 1);
+          }
+      }
+  }
+  return rowsToProcess;
+}
+
+//Reads data from Rubicon Sheet 
+function readRubiconSheetData(mySpreadsheet) {
+  var mySheet = mySpreadsheet.getSheets()[0];
+  var dataRange = mySheet.getDataRange();
+  var values = dataRange.getValues();
+  var allDatesArray = [];
+  for (var i = 1; i < values.length; i++) {
+    var myObject = {
+          date: standardizeDate(values[i][0]),
+          adSource: "Rubicon",
+          brand: getSiteName(values[i][1]),
+          platform: rubicon_FindPlatformValue(values[i][1], values[i][2]),
+          placement: values[i][1] + '_' + values[i][2] + '_' + values[i][3],
+          size: values[i][3].slice((values[i][3].indexOf('(') + 1), values[i][3].indexOf(')')),
+          impressions: values[i][4],
+          opportunities: values[i][6],
+          unfilled: values[i][6] - values[i][4],
+          revenue: values[i][5] * .85,
+          source: 'Programmatic'
+      };
+      allDatesArray.push(myObject);
+  }
+  return allDatesArray;
+}
+
+function rubicon_FindPlatformValue(columnOne, columnTwo){
+  var platformValue = '';
+  if (columnOne.indexOf('Mobile Web') > -1 || columnOne.indexOf('Tablet Web') > -1){
+    platformValue = testing_scrubPlatformValue(columnOne);
+    Logger.log('Platform value in if statement %s', platformValue)
+    
+  }
+  else {
+    platformValue = testing_scrubPlatformValue(columnTwo)
+  }
+  return platformValue;
+}
+
+//Reads data from Centro Sheet
+function readCentroSheetData(mySpreadsheet) {
+  var mySheet = mySpreadsheet.getSheets()[0];
+  var allDatesArray = [];
+  var startingCellTerm = 'Placements';
+  var endingCellTerm = 'Totals';
+  // +1 added to avoid header line - Date, Budget Spent...
+  var startingCellNumber = testing_findCell(mySpreadsheet, startingCellTerm) + 1;
+  var endingCellNumber = testing_findCell(mySpreadsheet, endingCellTerm);
+  for (var i = startingCellNumber; i < endingCellNumber; i++) {
+      var rowOfData = mySheet.getRange(i, 1, 1, 7).getValues();
+      var websiteInfoFromPrimaryCell = rowOfData[0][0].split(":: ");
+      var positionOfDeviceSize = websiteInfoFromPrimaryCell.indexOf('BTF');
+      var myObject = {
+        date: standardizeDate(rowOfData[0][1]),
+        adSource: 'Centro',
+        brand: getSiteName(websiteInfoFromPrimaryCell[0]),
+        platform: centro_isDeviceDefined(websiteInfoFromPrimaryCell),
+        placement: rowOfData[0][0],
+        size: websiteInfoFromPrimaryCell[positionOfDeviceSize - 1] ? websiteInfoFromPrimaryCell[positionOfDeviceSize - 1] : websiteInfoFromPrimaryCell[websiteInfoFromPrimaryCell.indexOf('BTF (SSL)') - 1],
+        impressions: rowOfData[0][2], //just sold impressions
+        opportunities: rowOfData[0][5],
+        unfilled: rowOfData[0][6],
+        revenue: rowOfData[0][3], //publisher payout
+        source: 'Programmatic'
+      };
+
+      if (myObject.brand.indexOf('Came up Null') == -1){
+         
+        allDatesArray.push(myObject);
+    }
+  }
+  Logger.log('All dates here!------- %s', allDatesArray[0]);
+  return allDatesArray;
+}
+
+function centro_isDeviceDefined(stringSplit) {
+  
+  var notDefined = 'Not defined';
+  if (stringSplit[1] === 'Tablet ' || stringSplit[1] === 'Mobile Web ') {
+      return stringSplit[1];
+  } else if (stringSplit.length == 4 && stringSplit.indexOf('Sports ') > -1 && stringSplit.indexOf('BTF') > -1 || stringSplit.indexOf('BTF (SSL)') > -1){
+    var platform = 'Desktop';
+    return platform;
+  } else {
+      return notDefined;
+  }
+};
+
+function standardizeDate(dateToProcess){
+  var moment = Moment.load();
+  var processedDate = moment(dateToProcess).format("YYYY-MM-DD");
+  return processedDate;
+};
+
+function getSiteName(myString) {
+    mySite = "";
+    if ((myString.indexOf("SEC Country") > -1) || (myString.indexOf("seccountry") > -1)) {
+        mySite = "SEC Country";
+    } else if ((myString.indexOf("All 22") > -1) || (myString.indexOf("all22") > -1) || (myString.indexOf("All22") > -1)) {
+        mySite = "All 22";
+    } else if ((myString.indexOf("Land of 10") > -1) || (myString.indexOf("landof10") > -1) || (myString.indexOf("LandOf10") > -1)) {
+        mySite = "Land of 10";
+    } else if ((myString.indexOf("Dawg Nation") > -1) || (myString.indexOf("DawgNation") > -1) || (myString.indexOf("dawgnation") > -1) || (myString.indexOf("Dawgnation") > -1)) {
+        mySite = "DawgNation";
+    } else if (myString.indexOf("Mundo Hispanico") > -1 ) {
+        mySite = "Mundo Hispanico";
+    } else if (myString.indexOf("DieHards") > -1  || myString.indexOf("Die Hards") > -1){
+        mySite = "DieHards";
+    } else if (myString === 'Hookem Free' || myString.indexOf("Hookem") > -1 || myString.indexOf("hookem") > -1){
+        mySite = "Hookem";
+    } else if (myString.indexOf("Southern Kitchen") > -1 ){
+        mySite = "Southern Kitchen";
+    } else if (myString.indexOf("Line and sight") > -1 ){
+        mySite = "Line and Sight";
+    } else {
+      //return null value? so as to have filter here for unntracked properties for now  
+      mySite = 'Came up Null';
+    }
+    return mySite;
+}
+
+function normalizePlatform(platform){
+  var platformNormalized = '';
+  if (platform.indexOf('MLB') > -1 || platform.indexOf('mobrec') > -1){
+    platformNormalized = 'Mobile Web';
+    return platformNormalized; 
+  }
+  else {
+    return platform;
+  }
+}
+
+function getFacebookData(){
+  var tableToUse = 'revenueUpdated';
+  var adSource = 'Facebook';
+  var accessToken = getFacebookAccessToken();
+  var datesToQuery = getDatesToQuery();
+  var requestData = JSON.parse(getRequestData(accessToken, datesToQuery.startDate));
+  var filledRequestsData = JSON.parse(getFilledRequestsData(accessToken, datesToQuery.startDate));
+  var estimatedRevenueData = JSON.parse(getEstimatedRevenueData(accessToken, datesToQuery.startDate));
+  var dataRecord = createRecordWithRequestData(requestData.data);
+  removePreviousEntries(tableToUse, adSource, datesToQuery);
+  mySqlRun(tableToUse, dataRecord);
+  var dataRecordImpressionsAdded = addFilledRequestsData(dataRecord, filledRequestsData.data, tableToUse);
+  var dataForUpload = addEstimatedRevenueData(dataRecordImpressionsAdded, estimatedRevenueData.data, tableToUse);
+}
+
+function getFacebookAccessToken(){
+  var url = 'https://graph.facebook.com/oauth/access_token?client_id=1189422781075889&client_secret=215556126853e9cae1dac1fd67ad7b7b&grant_type=client_credentials';
+  var response = JSON.parse(UrlFetchApp.fetch(url));
+  return response.access_token
+  
+ }
+
+function getRequestData(accessToken, startDate){
+  var url = 'https://graph.facebook.com/v2.9/1189422781075889/app_insights/app_event/?event_name=fb_ad_network_request&since=' + startDate + '&breakdowns[]=placement&aggregateBy=COUNT&access_token=' + encodeURIComponent(accessToken);
+  var response = UrlFetchApp.fetch(url);
+  //Logger.log('Check out the getRequestsData here ----------- %s', response);
+  return response;
+}
+
+function getFilledRequestsData(accessToken, startDate){
+  var url = 'https://graph.facebook.com/v2.9/1189422781075889/app_insights/app_event/?event_name=fb_ad_network_request&breakdowns[]=placement&since=' + startDate + '&aggregateBy=SUM&access_token=' + encodeURIComponent(accessToken);
+  
+  var response = UrlFetchApp.fetch(url);
+  //Logger.log('FilledRequests data----------------%s', response);
+  return response;
+}
+
+function getEstimatedRevenueData(accessToken, startDate){
+  var url = 'https://graph.facebook.com/v2.9/1189422781075889/app_insights/app_event/?event_name=fb_ad_network_revenue&breakdowns[]=placement&since=' + startDate + '&aggregateBy=SUM&access_token=' + encodeURIComponent(accessToken);
+  var params = {
+    muteHttpExceptions: true
+  }
+  var response = UrlFetchApp.fetch(url, params);
+  //Logger.log('EstimatedRevenue data----------------%s', response);
+  return response;
+}
+
+function getEstimatedRevenueData2(accessToken, startDate){
+  var url = 'https://graph.facebook.com/v2.9/1189422781075889/app_insights/app_event/?event_name=fb_ad_network_revenue&breakdowns[0]=placement&since=' + startDate + '&aggregateBy=SUM&access_token=' + encodeURIComponent(accessToken);
+  var params = {
+    muteHttpExceptions: true
+  }
+  var response = UrlFetchApp.fetch(url, params);
+  return response;
+}
+
+function createRecordWithRequestData(requestData){
+  var dataArray = []
+  for (var i = 0; i < requestData.length; i++){
+    Logger.log('Checking statement here %s', requestData[i].breakdowns.placement == '1318019768216189' ? '300x250' : '300x50') 
+    var myObj = {
+        date: standardizeDate(requestData[i].time),
+        adSource: "Facebook",
+        brand: 'Mundo Hispanico',
+        platform: 'Smartphone',
+        placement: requestData[i].breakdowns.placement,
+        //Two ad-placements exist now - this logic changes if another ad unit is added
+        size: requestData[i].breakdowns.placement == '1994792513872241' ? '300x50' : '300x250',
+        impressions: null,
+        opportunities: requestData[i].value,
+        revenue: null,
+        unfilled: null,
+        source: 'Programmatic'
+  }
+     dataArray.push(myObj);
+  }
+  return dataArray;
+}
+
+function addFilledRequestsData(dataRecord, filledRequestsData, tableToUse){
+  var conn = getMySqlConnection();
+  for (var i = 0; i < filledRequestsData.length; i++){
+    var stmt = conn.createStatement();
+    var executionString = 
+      "Update " + tableToUse + 
+        " SET impressions=" + filledRequestsData[i].value + ", unfilled= opportunities-impressions" + 
+        " WHERE date='" + standardizeDate(filledRequestsData[i].time) + "' AND placement='" + filledRequestsData[i].breakdowns.placement + "'";
+    var rs = stmt.executeUpdate(executionString);
+  }
+};
+
+function addEstimatedRevenueData(dataRecord, estimatedRevenue, tableToUse){
+  var conn = getMySqlConnection();
+  for (var i = 0; i < estimatedRevenue.length; i++){
+    var stmt = conn.createStatement();
+    var executionString = 
+      "Update " + tableToUse + 
+        " SET revenue=" + estimatedRevenue[i].value + 
+        " WHERE date='" + standardizeDate(estimatedRevenue[i].time) + "' AND placement='" + estimatedRevenue[i].breakdowns.placement + "'";
+    var rs = stmt.executeUpdate(executionString);
+  }
+}
+
+//SQL coding:
+
+//Write to SQLdb
+function mySqlRun(tableToUse, dataArray) {
+  var conn = getMySqlConnection();
+  conn.setAutoCommit(false);
+  Logger.log('here is the length of data to upload %s', dataArray.length);
+  var stmt = conn.prepareStatement('INSERT INTO ' + tableToUse 
+     + '(date, adSource, brand, platform, placement, size, impressions, opportunities, unfilled, revenue, source) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
+     + 'ON DUPLICATE KEY UPDATE impressions=values(impressions), opportunities=values(opportunities), unfilled = values(unfilled), revenue=values(revenue)');
+  for (var i = 0; i < dataArray.length; i++) {
+    stmt.setString(1, dataArray[i].date);
+    stmt.setString(2, dataArray[i].adSource);
+    stmt.setString(3, dataArray[i].brand);
+    stmt.setString(4, dataArray[i].platform);
+    stmt.setString(5, dataArray[i].placement);
+    stmt.setString(6, dataArray[i].size);
+    stmt.setString(7, dataArray[i].impressions);
+    stmt.setString(8, dataArray[i].opportunities);
+    stmt.setString(9, dataArray[i].unfilled);
+    stmt.setString(10, dataArray[i].revenue);
+    stmt.setString(11, dataArray[i].source);
+    stmt.addBatch();
+  }
+  executeMySqlBatch(stmt,conn)
+}
+
+function getMySqlConnection() {
+  var address = 'sample';
+  var user = 'sample';
+  var userPwd = 'sample';
+  var db = 'master';
+  var dbUrl = 'jdbc:mysql://' + address + '/' + db;
+  var myConn = Jdbc.getConnection(dbUrl, user, userPwd)
+  return myConn;
+}
+
+function executeMySqlBatch(myStatement, conn) {
+  var batch = myStatement.executeBatch();
+  conn.commit();
+  conn.close();
+}
+
+function sendEmailUpdate(adSource, rowsOfDataProcessed, tableToUse, emailDate, lengthOfThreadToProcess){ 
+  Logger.log(lengthOfThreadToProcess);
+  if (adSource){
+    var emailMessage = adSource + ', ' + 
+      rowsOfDataProcessed + ' new entries in ' + tableToUse +
+        '. The length of the threads to process = ' + lengthOfThreadToProcess;
+    MailApp.sendEmail('cmgverticalsreports@gmail.com', emailMessage, emailMessage);
+  }
+  //archiveQAMessage()
+}
